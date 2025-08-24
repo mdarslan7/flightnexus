@@ -27,17 +27,14 @@ def load_data():
     return df, df_critical
 @st.cache_resource
 def load_model():
-    """Loads the trained delay prediction model (enhanced ensemble if available)."""
     
     ensemble_path = os.path.join('models', 'ensemble_delay_predictor.joblib')
     legacy_path = os.path.join('models', 'delay_predictor.joblib')
-    
-    # Try ensemble model first
+
     if os.path.exists(ensemble_path):
         try:
             model = joblib.load(ensemble_path)
             
-            # Load associated encoders
             encoders = {}
             encoder_files = ['aircraft_encoder.joblib', 'route_encoder.joblib', 'aircraft_type_encoder.joblib']
             for encoder_file in encoder_files:
@@ -46,19 +43,17 @@ def load_model():
                     encoder_name = encoder_file.replace('.joblib', '')
                     encoders[encoder_name] = joblib.load(encoder_path)
             
-            # Load feature columns
             feature_columns_path = os.path.join('models', 'feature_columns.joblib')
             if os.path.exists(feature_columns_path):
                 feature_columns = joblib.load(feature_columns_path)
             else:
                 feature_columns = None
             
-            st.success("✅ Ensemble model loaded successfully!")
+            # st.success("✅ Ensemble model loaded successfully!")
             return {'model': model, 'encoders': encoders, 'feature_columns': feature_columns, 'type': 'ensemble'}
         except Exception as e:
             st.warning(f"⚠️ Ensemble model failed to load: {str(e)[:100]}... Falling back to legacy model.", icon="⚠️")
     
-    # Fallback to legacy model
     if os.path.exists(legacy_path):
         try:
             model = joblib.load(legacy_path)
@@ -74,13 +69,11 @@ def load_model():
 df, df_critical = load_data()
 model_data = load_model()
 
-# Safety check for model loading
 if model_data is None:
     st.error("🚨 Critical Error: No compatible model could be loaded. The application cannot function properly.")
     st.stop()
 
 def get_gemini_response(question, df):
-    """Generates a response from Gemini API."""
     if not genai:
         return "Gemini API is not configured. Please add your key to the .streamlit/secrets.toml file."
     model = genai.GenerativeModel('gemini-1.5-flash')
@@ -111,7 +104,6 @@ def get_gemini_response(question, df):
         return f"An error occurred with the Gemini API: {e}"
 
 def make_prediction(hour, to_dest, aircraft, model_data, df):
-    """Make prediction using either ensemble or legacy model"""
     if model_data['type'] == 'ensemble':
 
         try:
@@ -437,15 +429,31 @@ with tab3:
         if len(df_critical) > 0:
 
             risk_counts = display_critical['Risk Level'].value_counts()
-            fig3, ax3 = plt.subplots(figsize=(8, 6))
-            colors_pie = ['#ff4444', '#ff8800', '#ffdd00']
-            wedges, texts, autotexts = ax3.pie(risk_counts.values, labels=risk_counts.index, 
-                                              colors=colors_pie, autopct='%1.0f%%', startangle=90)
-            ax3.set_title('Critical Flight Risk Distribution')
-
-            for autotext in autotexts:
-                autotext.set_color('white')
-                autotext.set_weight('bold')
+            
+            # Use a clean bar chart instead of pie chart to avoid text overlap
+            fig3, ax3 = plt.subplots(figsize=(8, 5))
+            colors_bar = ['#ff4444', '#ff8800', '#ffdd00']
+            
+            bars = ax3.bar(
+                risk_counts.index, 
+                risk_counts.values, 
+                color=colors_bar[:len(risk_counts)]
+            )
+            
+            ax3.set_title('Critical Flight Risk Distribution', fontsize=14, weight='bold', pad=20)
+            ax3.set_ylabel('Number of Flights', fontsize=12)
+            ax3.set_xlabel('Risk Level', fontsize=12)
+            
+            # Add value labels on top of bars
+            for bar, value in zip(bars, risk_counts.values):
+                height = bar.get_height()
+                ax3.text(bar.get_x() + bar.get_width()/2., height + 0.1,
+                        f'{value}\n({value/len(display_critical)*100:.0f}%)',
+                        ha='center', va='bottom', fontweight='bold', fontsize=10)
+            
+            ax3.grid(True, alpha=0.3, axis='y')
+            plt.xticks(rotation=0)
+            plt.tight_layout()
             st.pyplot(fig3)
 
             st.markdown("#### 🔗 Cascade Metrics")

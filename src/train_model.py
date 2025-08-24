@@ -64,9 +64,6 @@ def create_enhanced_features(df):
     print(f"Clean delay data points: {len(df_sorted)}")
     return df_sorted
 def train_model():
-    """
-    Trains an enhanced ensemble model to predict flight departure delays.
-    """
     print("--- Enhanced Model Training Started ---")
     data_path = os.path.join('data', 'cleaned_flight_data.csv')
     df = pd.read_csv(data_path, parse_dates=['STD_datetime', 'ATD_datetime', 'STA_datetime', 'ATA_datetime'])
