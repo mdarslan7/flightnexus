@@ -32,24 +32,59 @@ def load_data():
 
 @st.cache_resource
 def load_model():
-    model_path = os.path.join('models', 'delay_predictor.joblib')
-
-    if not os.path.exists(model_path):
-        st.error("Model file not found! Please run the backend pipeline first by executing 'python -m src.main' in your terminal.", icon="🚨")
+    """Loads the trained delay prediction model (enhanced ensemble if available)."""
+    # Try to load enhanced ensemble model first
+    ensemble_path = os.path.join('models', 'ensemble_delay_predictor.joblib')
+    legacy_path = os.path.join('models', 'delay_predictor.joblib')
+    
+    if os.path.exists(ensemble_path):
+        try:
+            # Load ensemble model and related encoders
+            model = joblib.load(ensemble_path)
+            
+            # Load encoders for enhanced features
+            encoders = {}
+            encoder_files = ['aircraft_encoder.joblib', 'route_encoder.joblib', 'aircraft_type_encoder.joblib']
+            for encoder_file in encoder_files:
+                encoder_path = os.path.join('models', encoder_file)
+                if os.path.exists(encoder_path):
+                    encoder_name = encoder_file.replace('.joblib', '')
+                    encoders[encoder_name] = joblib.load(encoder_path)
+            
+            # Load feature columns
+            feature_columns_path = os.path.join('models', 'feature_columns.joblib')
+            if os.path.exists(feature_columns_path):
+                feature_columns = joblib.load(feature_columns_path)
+            else:
+                feature_columns = None
+                
+            return {'model': model, 'encoders': encoders, 'feature_columns': feature_columns, 'type': 'ensemble'}
+            
+        except Exception as e:
+            st.warning(f"Failed to load ensemble model: {e}. Falling back to legacy model.", icon="⚠️")
+    
+    # Fall back to legacy model
+    if os.path.exists(legacy_path):
+        model = joblib.load(legacy_path)
+        return {'model': model, 'type': 'legacy'}
+    else:
+        st.error("No model files found! Please run the backend pipeline first by executing 'python -m src.main' in your terminal.", icon="🚨")
         return None
 
-    model = joblib.load(model_path)
-    return model
-
+# Load all assets
+# Load all assets
 df, df_critical = load_data()
-model = load_model()
+model_data = load_model()
 
+# --- HELPER FUNCTION FOR NLP ---
 def get_gemini_response(question, df):
+    """Generates a response from Gemini API."""
     if not genai:
         return "Gemini API is not configured. Please add your key to the .streamlit/secrets.toml file."
     
     model = genai.GenerativeModel('gemini-1.5-flash')
-
+    
+    # Create comprehensive data summary instead of just head()
     data_summary = f"""
     Dataset Overview:
     - Total flights: {len(df)}
@@ -83,13 +118,136 @@ def get_gemini_response(question, df):
     except Exception as e:
         return f"An error occurred with the Gemini API: {e}"
 
+# --- PREDICTION HELPER FUNCTION ---
+def make_prediction(hour, to_dest, aircraft, model_data, df):
+    """Make prediction using either ensemble or legacy model"""
+    
+    if model_data['type'] == 'ensemble':
+        # Enhanced prediction with realistic feature values
+        try:
+            # Calculate realistic feature values from actual data
+            avg_departure_delay = df['departure_delay'].mean() if 'departure_delay' in df.columns else 0
+            if pd.isna(avg_departure_delay):
+                avg_departure_delay = 0
+                
+            # Calculate average values for more realistic predictions
+            route_key = f"Mumbai (BOM)_{to_dest}"
+            route_delays = df[df['To'] == to_dest]['departure_delay'] if 'departure_delay' in df.columns else [5]
+            route_avg = route_delays.mean() if len(route_delays) > 0 and not pd.isna(route_delays.mean()) else 5
+            
+            aircraft_delays = df[df['Aircraft'] == aircraft]['departure_delay'] if 'departure_delay' in df.columns else [3]
+            aircraft_avg = aircraft_delays.mean() if len(aircraft_delays) > 0 and not pd.isna(aircraft_delays.mean()) else 3
+            
+            # Count flights at this hour from data
+            hour_flights = df[df['STD_datetime'].dt.hour == hour] if 'STD_datetime' in df.columns else []
+            flights_this_hour = len(hour_flights) if len(hour_flights) > 0 else 3
+            
+            # Create realistic input dataframe
+            input_data = {
+                'hour': [hour],
+                'day_of_week': [1],  # Tuesday (more realistic than Monday)
+                'month': [7],  # July 
+                'is_weekend': [0],
+                'is_peak_hour': [1 if hour in [6, 7, 8, 9, 18, 19, 20, 21] else 0],
+                'scheduled_duration': [1.5],  # More realistic 1.5 hours
+                'flights_same_hour': [min(flights_this_hour, 8)],  # Realistic based on data
+                'total_flights_same_hour': [min(flights_this_hour * 2, 15)],  # Reasonable total
+                'route_avg_delay_7d': [max(0, min(route_avg, 30))],  # Cap at 30 minutes
+                'aircraft_avg_delay_3d': [max(0, min(aircraft_avg, 20))],  # Cap at 20 minutes
+                'prev_arrival_delay': [2],  # Low previous delay
+                'turnaround_time': [4],  # 4 hours turnaround
+                'route_complexity': [1 if 'India' in to_dest or any(city in to_dest for city in ['Delhi', 'Chennai', 'Bengaluru']) else 2],  # Domestic vs international
+            }
+            
+            # Encode categorical variables with better error handling
+            encoders = model_data['encoders']
+            
+            if 'aircraft_encoder' in encoders:
+                try:
+                    aircraft_encoded = encoders['aircraft_encoder'].transform([aircraft])[0]
+                except:
+                    # Use a middle value from the encoder's classes
+                    try:
+                        aircraft_encoded = len(encoders['aircraft_encoder'].classes_) // 2
+                    except:
+                        aircraft_encoded = 0
+                input_data['aircraft_encoded'] = [aircraft_encoded]
+            else:
+                input_data['aircraft_encoded'] = [0]
+            
+            if 'route_encoder' in encoders:
+                route = f"Mumbai (BOM)_{to_dest}"
+                try:
+                    route_encoded = encoders['route_encoder'].transform([route])[0]
+                except:
+                    # Use a middle value from the encoder's classes
+                    try:
+                        route_encoded = len(encoders['route_encoder'].classes_) // 2
+                    except:
+                        route_encoded = 0
+                input_data['route_encoded'] = [route_encoded]
+            else:
+                input_data['route_encoded'] = [0]
+            
+            if 'aircraft_type_encoder' in encoders:
+                aircraft_type = aircraft.split('(')[0].strip()
+                try:
+                    aircraft_type_encoded = encoders['aircraft_type_encoder'].transform([aircraft_type])[0]
+                except:
+                    # Use a middle value from the encoder's classes
+                    try:
+                        aircraft_type_encoded = len(encoders['aircraft_type_encoder'].classes_) // 2
+                    except:
+                        aircraft_type_encoded = 0
+                input_data['aircraft_type_encoded'] = [aircraft_type_encoded]
+            else:
+                input_data['aircraft_type_encoded'] = [0]
+            
+            input_df = pd.DataFrame(input_data)
+            
+            # Make prediction
+            prediction = model_data['model'].predict(input_df)
+            
+            # Apply reasonable bounds to the prediction
+            bounded_prediction = max(0, min(prediction[0], 120))  # Cap between 0-120 minutes
+            
+            return bounded_prediction, "ensemble"
+            
+        except Exception as e:
+            st.warning(f"Ensemble prediction failed: {e}. Using legacy model.")
+            # Fall back to legacy prediction
+            pass
+    
+    # Legacy model or fallback prediction
+    try:
+        input_df = pd.DataFrame({
+            'hour': [hour],
+            'day_of_week': [1],  # Use Tuesday instead of Monday
+            'Aircraft_Type': [aircraft.split('(')[0].strip()],
+            'To': [to_dest],
+            'Aircraft': [aircraft]
+        })
+        
+        if model_data['type'] == 'ensemble':
+            # Use the gradient boosting component of ensemble as fallback
+            prediction = model_data['model'].estimators_[1].predict(input_df)  # GB model
+        else:
+            prediction = model_data['model'].predict(input_df)
+            
+        return max(0, min(prediction[0], 90)), "legacy"  # Apply bounds
+    except Exception as e:
+        st.error(f"Prediction failed: {e}")
+        return 15.0, "default"  # Reasonable default prediction
+
+# --- UI LAYOUT ---
 st.title("✈️ AI-Powered Flight Scheduling Assistant")
 st.markdown("An interactive dashboard to analyze flight data, predict delays, and identify critical flights at Mumbai Airport (BOM).")
 
-if df is None or df_critical is None or model is None:
+# Stop the app if data is not loaded
+if df is None or df_critical is None or model_data is None:
     st.stop()
 
-tab1, tab2, tab3, tab4 = st.tabs(["📊 Airport Overview", "⚙️ Schedule Tuner", "🚨 Critical Flights", "💬 Ask Gemini"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Airport Overview", "⚙️ Schedule Tuner", "🚨 Critical Flights", "💬 Ask Gemini", "🔬 Model Insights"])
 
 with tab1:
     st.header("Airport Overview: Busiest Times and Delays")
@@ -229,16 +387,30 @@ with tab2:
         to_dest = st.selectbox("Destination", options=sorted(df['To'].unique()))
         aircraft = st.selectbox("Aircraft", options=sorted(df['Aircraft'].unique()))
     with col2:
-        input_df = pd.DataFrame({
-            'hour': [hour],
-            'day_of_week': [0], 
-            'Aircraft_Type': [aircraft.split('(')[0].strip()],
-            'To': [to_dest],
-            'Aircraft': [aircraft] 
-        })
-        prediction = model.predict(input_df)
-        st.metric(label="Predicted Departure Delay", value=f"{prediction[0]:.2f} minutes")
-        st.info("This prediction is based on historical data. A lower value suggests a more optimal time slot.", icon="ℹ️")
+        # Make prediction using the enhanced function
+        prediction_value, model_type = make_prediction(hour, to_dest, aircraft, model_data, df)
+        
+        st.metric(label="Predicted Departure Delay", value=f"{prediction_value:.2f} minutes")
+        
+        # Show model type info
+        if model_type == "ensemble":
+            st.success("✨ Enhanced ensemble prediction", icon="🚀")
+        elif model_type == "legacy":  
+            st.info("📊 Legacy model prediction", icon="ℹ️")
+        else:
+            st.warning("⚠️ Default estimation", icon="⚠️")
+        
+        # Prediction interpretation
+        if prediction_value < 5:
+            st.success("🟢 Excellent time slot - Minimal delay expected")
+        elif prediction_value < 15:
+            st.warning("🟡 Good time slot - Low delay expected") 
+        elif prediction_value < 30:
+            st.warning("🟠 Fair time slot - Moderate delay expected")
+        else:
+            st.error("🔴 Poor time slot - High delay expected")
+            
+        st.info("💡 This prediction is based on historical patterns. Consider trying different hours to find optimal slots.", icon="ℹ️")
 
 with tab3:
     st.header("Critical Flights Analysis")
@@ -252,3 +424,168 @@ with tab4:
     if user_question:
         with st.spinner("Gemini is analyzing the data..."):
             st.markdown(get_gemini_response(user_question, df))
+
+with tab5:
+    st.header("🔬 Model Performance & Insights")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.subheader("Model Accuracy Metrics")
+        
+        # Load model performance metrics
+        metrics_path = os.path.join('models', 'model_metrics.json')
+        if os.path.exists(metrics_path):
+            import json
+            with open(metrics_path, 'r') as f:
+                metrics = json.load(f)
+            
+            st.metric("Mean Absolute Error", f"{metrics.get('mae', 0):.2f} minutes", 
+                     help="Average prediction error in minutes")
+            st.metric("Root Mean Square Error", f"{metrics.get('rmse', 0):.2f} minutes",
+                     help="Standard deviation of prediction errors")
+            st.metric("R² Score", f"{metrics.get('r2', 0):.3f}",
+                     help="Proportion of variance explained by the model (0-1)")
+            
+            # Training info
+            st.markdown("### 📋 Training Information")
+            st.info(f"""
+            - **Training Samples**: {metrics.get('training_samples', 'N/A'):,}
+            - **Test Samples**: {metrics.get('test_samples', 'N/A'):,}
+            - **Features Used**: {metrics.get('features_count', 'N/A')}
+            """)
+        else:
+            st.warning("Model metrics not found. Please retrain the model with enhanced features.")
+        
+        st.subheader("Data Quality Insights")
+        
+        # Data quality metrics
+        st.metric("Total Flight Records", f"{len(df):,}")
+        
+        # Calculate date range properly
+        try:
+            date_range = (pd.to_datetime(df['Date']).max() - pd.to_datetime(df['Date']).min()).days
+            st.metric("Date Range", f"{date_range} days")
+        except:
+            st.metric("Date Range", "N/A")
+            
+        st.metric("Unique Aircraft", f"{df['Aircraft'].nunique()}")
+        st.metric("Unique Destinations", f"{df['To'].nunique()}")
+    
+    with col2:
+        st.subheader("Feature Importance")
+        
+        # Display feature importance
+        feature_imp_path = os.path.join('models', 'feature_importance.csv')
+        if os.path.exists(feature_imp_path):
+            feature_imp = pd.read_csv(feature_imp_path)
+            
+            fig, ax = plt.subplots(figsize=(10, 6))
+            top_features = feature_imp.head(10)
+            bars = ax.barh(range(len(top_features)), top_features['importance'])
+            ax.set_yticks(range(len(top_features)))
+            ax.set_yticklabels(top_features['feature'])
+            ax.set_xlabel('Importance Score')
+            ax.set_title('Top 10 Most Important Features')
+            ax.invert_yaxis()
+            
+            # Color bars by importance
+            colors = plt.cm.viridis([x/max(top_features['importance']) for x in top_features['importance']])
+            for bar, color in zip(bars, colors):
+                bar.set_color(color)
+            
+            st.pyplot(fig)
+        else:
+            st.info("Feature importance data not available. Retrain model to see feature analysis.")
+        
+        st.subheader("Model Recommendations")
+        
+        # Model performance insights
+        if os.path.exists(metrics_path):
+            with open(metrics_path, 'r') as f:
+                metrics = json.load(f)
+                
+            r2_score = metrics.get('r2', 0)
+            mae_score = metrics.get('mae', 100)
+            
+            if r2_score > 0.8:
+                st.success("🎯 Excellent model performance!")
+            elif r2_score > 0.6:
+                st.warning("⚠️ Good model performance with room for improvement")
+            else:
+                st.error("❌ Model needs improvement")
+                
+            if mae_score < 10:
+                st.success("✅ High prediction accuracy (±10 minutes)")
+            elif mae_score < 20:
+                st.warning("⚠️ Moderate accuracy (±20 minutes)")
+            else:
+                st.error("❌ Low accuracy - consider more features")
+        
+        # Recommendations
+        st.markdown("### 🎯 Enhancement Recommendations:")
+        st.markdown("""
+        ✅ **Implemented Enhancements:**
+        - Advanced ensemble modeling (RF + GB + XGB)
+        - 15+ engineered features
+        - Multiple centrality measures for critical flights
+        - Enhanced time-based and operational features
+        
+        🔄 **Future Improvements:**
+        - Weather data integration
+        - Real-time airport congestion
+        - Passenger load factors
+        - Seasonal pattern analysis
+        - Gate assignment optimization
+        """)
+        
+    # Enhanced Critical Flights Analysis
+    st.markdown("---")
+    st.subheader("🚨 Enhanced Critical Flights Analysis")
+    
+    enhanced_critical_path = os.path.join('data', 'enhanced_critical_flights.csv')
+    if os.path.exists(enhanced_critical_path):
+        enhanced_critical = pd.read_csv(enhanced_critical_path)
+        
+        if len(enhanced_critical) > 0:
+            col3, col4 = st.columns(2)
+            
+            with col3:
+                st.markdown("**Critical Flights by Centrality Type**")
+                
+                # Show different centrality measures
+                display_df = enhanced_critical[['Flight Number', 'Date', 'combined_centrality', 
+                                              'degree_centrality', 'betweenness_centrality', 
+                                              'pagerank_score']].head(10)
+                st.dataframe(display_df, use_container_width=True)
+            
+            with col4:
+                st.markdown("**Network Connections**")
+                
+                # Show connection details
+                connection_df = enhanced_critical[['Flight Number', 'Date', 'connections_out', 
+                                                 'connections_in', 'combined_centrality']].head(10)
+                
+                # Create a scatter plot of connections
+                fig, ax = plt.subplots(figsize=(8, 6))
+                scatter = ax.scatter(connection_df['connections_out'], 
+                                   connection_df['connections_in'],
+                                   s=connection_df['combined_centrality']*1000,
+                                   c=connection_df['combined_centrality'], 
+                                   cmap='Reds', alpha=0.6)
+                ax.set_xlabel('Outgoing Connections')
+                ax.set_ylabel('Incoming Connections')
+                ax.set_title('Flight Network Connections')
+                plt.colorbar(scatter, label='Centrality Score')
+                
+                # Add annotations for top 3 flights
+                for i, row in connection_df.head(3).iterrows():
+                    ax.annotate(f"{row['Flight Number']}", 
+                              (row['connections_out'], row['connections_in']),
+                              xytext=(5, 5), textcoords='offset points', fontsize=8)
+                
+                st.pyplot(fig)
+        else:
+            st.info("No enhanced critical flights data available. Please retrain the analysis.")
+    else:
+        st.info("Enhanced critical flights analysis not found. Retrain models to see detailed network analysis.")
