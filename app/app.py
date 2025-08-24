@@ -28,14 +28,16 @@ def load_data():
 @st.cache_resource
 def load_model():
     """Loads the trained delay prediction model (enhanced ensemble if available)."""
-
+    
     ensemble_path = os.path.join('models', 'ensemble_delay_predictor.joblib')
     legacy_path = os.path.join('models', 'delay_predictor.joblib')
+    
+    # Try ensemble model first
     if os.path.exists(ensemble_path):
         try:
-
             model = joblib.load(ensemble_path)
-
+            
+            # Load associated encoders
             encoders = {}
             encoder_files = ['aircraft_encoder.joblib', 'route_encoder.joblib', 'aircraft_type_encoder.joblib']
             for encoder_file in encoder_files:
@@ -43,25 +45,39 @@ def load_model():
                 if os.path.exists(encoder_path):
                     encoder_name = encoder_file.replace('.joblib', '')
                     encoders[encoder_name] = joblib.load(encoder_path)
-
+            
+            # Load feature columns
             feature_columns_path = os.path.join('models', 'feature_columns.joblib')
             if os.path.exists(feature_columns_path):
                 feature_columns = joblib.load(feature_columns_path)
             else:
                 feature_columns = None
+            
+            st.success("✅ Ensemble model loaded successfully!")
             return {'model': model, 'encoders': encoders, 'feature_columns': feature_columns, 'type': 'ensemble'}
         except Exception as e:
-            st.warning(f"Failed to load ensemble model: {e}. Falling back to legacy model.", icon="⚠️")
-
+            st.warning(f"⚠️ Ensemble model failed to load: {str(e)[:100]}... Falling back to legacy model.", icon="⚠️")
+    
+    # Fallback to legacy model
     if os.path.exists(legacy_path):
-        model = joblib.load(legacy_path)
-        return {'model': model, 'type': 'legacy'}
+        try:
+            model = joblib.load(legacy_path)
+            st.info("ℹ️ Using legacy model", icon="ℹ️")
+            return {'model': model, 'type': 'legacy'}
+        except Exception as e:
+            st.error(f"❌ Both models failed to load. Error: {str(e)[:100]}...", icon="🚨")
+            return None
     else:
-        st.error("No model files found! Please run the backend pipeline first by executing 'python -m src.main' in your terminal.", icon="🚨")
+        st.error("❌ No model files found! Please run the backend pipeline first by executing 'python -m src.main' in your terminal.", icon="🚨")
         return None
 
 df, df_critical = load_data()
 model_data = load_model()
+
+# Safety check for model loading
+if model_data is None:
+    st.error("🚨 Critical Error: No compatible model could be loaded. The application cannot function properly.")
+    st.stop()
 
 def get_gemini_response(question, df):
     """Generates a response from Gemini API."""
