@@ -1,4 +1,4 @@
-# AI-Powered Flight Scheduling Assistant
+# FlightNexus: AI-Powered Flight Scheduling Assistant
 
 **🔗 Project Links:**
 
